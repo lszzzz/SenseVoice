@@ -1,24 +1,18 @@
-from typing import Iterable, Optional
-import types
-import time
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torch import Tensor
-from torch import nn
-from torch.cuda.amp import autocast
-from funasr.metrics.compute_acc import compute_accuracy, th_accuracy
-from funasr.losses.label_smoothing_loss import LabelSmoothingLoss
-from funasr.train_utils.device_funcs import force_gatherable
 
-from funasr.utils.load_utils import load_audio_text_image_video, extract_fbank
-from funasr.utils.datadir_writer import DatadirWriter
-from funasr.models.ctc.ctc import CTC
+import time
+import torch
+from torch import nn
+import torch.nn.functional as F
+from typing import Iterable, Optional
 
 from funasr.register import tables
-
-
+from funasr.models.ctc.ctc import CTC
+from funasr.utils.datadir_writer import DatadirWriter
 from funasr.models.paraformer.search import Hypothesis
+from funasr.train_utils.device_funcs import force_gatherable
+from funasr.losses.label_smoothing_loss import LabelSmoothingLoss
+from funasr.metrics.compute_acc import compute_accuracy, th_accuracy
+from funasr.utils.load_utils import load_audio_text_image_video, extract_fbank
 
 
 class SinusoidalPositionEncoder(torch.nn.Module):
@@ -642,6 +636,7 @@ class SenseVoiceSmall(nn.Module):
         self.textnorm_dict = {"withitn": 14, "woitn": 15}
         self.textnorm_int_dict = {25016: 14, 25017: 15}
         self.embed = torch.nn.Embedding(7 + len(self.lid_dict) + len(self.textnorm_dict), input_size)
+        self.emo_dict = {"unk": 25009, "happy": 25001, "sad": 25002, "angry": 25003, "neutral": 25004}
         
         self.criterion_att = LabelSmoothingLoss(
             size=self.vocab_size,
@@ -696,10 +691,11 @@ class SenseVoiceSmall(nn.Module):
             encoder_out[:, :4, :], text[:, :4]
         )
 
-        loss = loss_ctc
+        loss = loss_ctc + loss_rich
         # Collect total loss stats
-        stats["loss"] = torch.clone(loss.detach()) if loss_ctc is not None else None
+        stats["loss_ctc"] = torch.clone(loss_ctc.detach()) if loss_ctc is not None else None
         stats["loss_rich"] = torch.clone(loss_rich.detach()) if loss_rich is not None else None
+        stats["loss"] = torch.clone(loss.detach()) if loss is not None else None
         stats["acc_rich"] = acc_rich
 
         # force_gatherable: to-device and to-tensor if scalar for DataParallel
@@ -857,6 +853,8 @@ class SenseVoiceSmall(nn.Module):
 
         # c. Passed the encoder result and the beam search
         ctc_logits = self.ctc.log_softmax(encoder_out)
+        if kwargs.get("ban_emo_unk", False):
+            ctc_logits[:, :, self.emo_dict["unk"]] = -float("inf")
 
         results = []
         b, n, d = encoder_out.size()
@@ -890,7 +888,7 @@ class SenseVoiceSmall(nn.Module):
         return results, meta_data
 
     def export(self, **kwargs):
-        from .export_meta import export_rebuild_model
+        from export_meta import export_rebuild_model
 
         if "max_seq_len" not in kwargs:
             kwargs["max_seq_len"] = 512
